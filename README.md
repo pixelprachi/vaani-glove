@@ -154,8 +154,8 @@ The gloves advertise over BLE as `Vaani-Left` and `Vaani-Right`.
 | Name | Role |
 |---|---|
 | **Rishi Jha** | Glove and hub firmware, hardware ([@rishi-jha-exe](https://github.com/rishi-jha-exe)) |
-| **Prachi Sahu** | Backend and companion app |
-| **Prakhar Sharma** | Team member |
+| **Prachi Sahu** | Backend and Training |
+| **Prakhar Sharma** | Frontend & Website |
 
 B.Tech CSE, Amity University Madhya Pradesh.
 
