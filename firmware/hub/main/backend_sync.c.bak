@@ -1,0 +1,272 @@
+#include <string.h>
+#include <stdio.h>
+#include "esp_http_client.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "cJSON.h"
+#include "dtw_match.h"
+#include "settings.h"
+#include "recording.h"
+#include "esp_heap_caps.h"
+#include "backend_sync.h"
+#include "wifi_init.h"
+
+#define BACKEND_HOST "http://172.25.32.170:8000"
+
+static const char *TAG = "backend_sync";
+
+typedef struct {
+    char source[16];
+    char text[64];
+    float conf;
+} transcript_msg_t;
+
+typedef struct {
+    char sign_id[64];
+    float window[WINDOW_LEN][CHANNELS];
+} complete_recording_msg_t;
+
+typedef struct {
+    bool connected;
+} connection_status_msg_t;
+
+static QueueHandle_t transcript_queue;
+static QueueHandle_t complete_recording_queue;
+static QueueHandle_t connection_status_queue;
+
+void backend_sync_init(void) {
+    transcript_queue = xQueueCreate(16, sizeof(transcript_msg_t));
+    complete_recording_queue = xQueueCreate(1, sizeof(complete_recording_msg_t));
+    connection_status_queue = xQueueCreate(1, sizeof(connection_status_msg_t));
+}
+
+void backend_sync_queue_transcript(const char *source, const char *text, float conf) {
+    transcript_msg_t msg;
+    strncpy(msg.source, source, sizeof(msg.source) - 1);
+    strncpy(msg.text, text, sizeof(msg.text) - 1);
+    msg.conf = conf;
+    xQueueSend(transcript_queue, &msg, 0);
+}
+
+void backend_sync_queue_connection_status(bool connected) {
+    connection_status_msg_t msg = { .connected = connected };
+    xQueueOverwrite(connection_status_queue, &msg);
+}
+
+static char *http_get(const char *path) {
+    char url[128]; snprintf(url, sizeof(url), "%s%s", BACKEND_HOST, path);
+    esp_http_client_config_t config = { .url = url, .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) { return NULL; }
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) { esp_http_client_cleanup(client); return NULL; }
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) { esp_http_client_close(client); esp_http_client_cleanup(client); return NULL; }
+    char *buf = malloc(content_length + 1);
+    if (buf == NULL) { esp_http_client_close(client); esp_http_client_cleanup(client); return NULL; }
+    int read_len = esp_http_client_read(client, buf, content_length);
+    if (read_len < 0) { free(buf); esp_http_client_close(client); esp_http_client_cleanup(client); return NULL; }
+    buf[read_len] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return buf;
+}
+
+static void http_post_json(const char *path, const char *source, const char *text, float conf) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s%s?user_id=%s&source=%s&text=%s&confidence=%.2f",
+             BACKEND_HOST, path, current_user_id(), source, text, conf);
+    esp_http_client_config_t config = { .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) { return; }
+    esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+}
+
+static bool http_post_json_body(const char *path, const char *json_body) {
+    char url[128]; snprintf(url, sizeof(url), "%s%s", BACKEND_HOST, path);
+    esp_http_client_config_t config = { .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "esp_http_client_init failed for %s", url);
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json_body, strlen(json_body));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "POST %s failed: err=%s, status=%d", path, esp_err_to_name(err), status);
+        return false;
+    }
+    return true;
+}
+
+void backend_sync_mark_armed(const char *sign_id) {
+    char path[96];
+    snprintf(path, sizeof(path), "/vocabulary/personal/%s/arm", sign_id);
+    http_post_json_body(path, "{}");
+}
+
+static void backend_sync_complete_recording(const char *sign_id, float window[WINDOW_LEN][CHANNELS]) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *template_windows = cJSON_CreateArray();
+    cJSON *win = cJSON_CreateArray();
+    for (int r = 0; r < WINDOW_LEN; r++) {
+        cJSON *row = cJSON_CreateArray();
+        for (int c = 0; c < CHANNELS; c++) {
+            cJSON_AddItemToArray(row, cJSON_CreateNumber(window[r][c]));
+        }
+        cJSON_AddItemToArray(win, row);
+    }
+    cJSON_AddItemToArray(template_windows, win);
+    cJSON_AddItemToObject(root, "template_windows", template_windows);
+
+    char *body = cJSON_PrintUnformatted(root);
+    if (body != NULL) {
+        char path[96];
+        snprintf(path, sizeof(path), "/vocabulary/personal/%s/complete", sign_id);
+        if (!http_post_json_body(path, body)) {
+            ESP_LOGE(TAG, "Failed to submit recorded template for sign %s", sign_id);
+        }
+        free(body);
+    }
+    cJSON_Delete(root);
+}
+
+void backend_sync_queue_complete_recording(const char *sign_id, float window[WINDOW_LEN][CHANNELS]) {
+    static complete_recording_msg_t msg;
+    strncpy(msg.sign_id, sign_id, sizeof(msg.sign_id) - 1);
+    msg.sign_id[sizeof(msg.sign_id) - 1] = '\0';
+    memcpy(msg.window, window, sizeof(msg.window));
+    if (xQueueSend(complete_recording_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "complete_recording_queue full, dropping submission for sign %s", sign_id);
+    }
+}
+
+static void pull_personal_vocabulary(void) {
+    char path[96]; snprintf(path, sizeof(path), "/vocabulary/personal?user_id=%s", current_user_id());
+    char *body = http_get(path);
+    if (body == NULL) { return; }
+    cJSON *arr = cJSON_Parse(body);
+    if (arr == NULL) { free(body); return; }
+    static personal_sign_t *signs = NULL;
+    if (signs == NULL) {
+        signs = heap_caps_malloc(sizeof(personal_sign_t) * MAX_PERSONAL_SIGNS, MALLOC_CAP_SPIRAM);
+    }
+    int count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        if (count >= MAX_PERSONAL_SIGNS) break;
+        strncpy(signs[count].text, cJSON_GetObjectItem(item, "text")->valuestring, 63);
+        cJSON *templates = cJSON_GetObjectItem(item, "template");
+        signs[count].template_count = cJSON_GetArraySize(templates);
+        for (int t = 0; t < signs[count].template_count && t < MAX_TEMPLATES_PER_SIGN; t++) {
+            cJSON *window = cJSON_GetArrayItem(templates, t);
+            for (int r = 0; r < WINDOW_LEN; r++) {
+                cJSON *row = cJSON_GetArrayItem(window, r);
+                for (int c = 0; c < CHANNELS; c++) {
+                    signs[count].templates[t][r][c] = (float)cJSON_GetArrayItem(row, c)->valuedouble;
+                }
+            }
+        }
+        count++;
+    }
+    dtw_match_load_signs(signs, count);
+    cJSON_Delete(arr);
+    free(body);
+}
+
+static void pull_language_setting(void) {
+    char path[96]; snprintf(path, sizeof(path), "/users/%s/language", current_user_id());
+    char *body = http_get(path);
+    if (body == NULL) { return; }
+    cJSON *obj = cJSON_Parse(body);
+    if (obj == NULL) { free(body); return; }
+    cJSON *lang = cJSON_GetObjectItem(obj, "language");
+    if (lang != NULL && lang->valuestring != NULL) {
+        set_active_language(lang->valuestring);
+    }
+    cJSON_Delete(obj);
+    free(body);
+}
+
+static void pull_pending_recording(void) {
+    if (recording_mode_active()) return;
+    char path[96]; snprintf(path, sizeof(path), "/vocabulary/personal/pending?user_id=%s", current_user_id());
+    char *body = http_get(path);
+    if (body == NULL) return;
+    cJSON *arr = cJSON_Parse(body);
+    if (arr != NULL) {
+        cJSON *first = cJSON_GetArrayItem(arr, 0);
+        if (first != NULL) {
+            cJSON *id = cJSON_GetObjectItem(first, "id");
+            cJSON *text = cJSON_GetObjectItem(first, "text");
+            if (id != NULL && id->valuestring != NULL && text != NULL && text->valuestring != NULL) {
+                recording_start(id->valuestring, text->valuestring);
+            }
+        }
+        cJSON_Delete(arr);
+    }
+    free(body);
+}
+
+void backend_sync_task(void *arg) {
+    ESP_LOGI(TAG, "backend_sync_task started and running");
+    transcript_msg_t msg;
+    static complete_recording_msg_t crmsg;
+    connection_status_msg_t csmsg;
+    TickType_t last_pull = 0;
+    TickType_t last_retry = 0;
+    bool target_connected = false;
+    bool status_needs_sync = false;
+
+    while (1) {
+        if (xQueueReceive(transcript_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (wifi_is_connected()) {
+                http_post_json("/transcript", msg.source, msg.text, msg.conf);
+            }
+        }
+        if (xQueueReceive(complete_recording_queue, &crmsg, 0) == pdTRUE) {
+            if (wifi_is_connected()) {
+                backend_sync_complete_recording(crmsg.sign_id, crmsg.window);
+            }
+        }
+        if (xQueueReceive(connection_status_queue, &csmsg, 0) == pdTRUE) {
+            target_connected = csmsg.connected;
+            status_needs_sync = true;
+            ESP_LOGI(TAG, "Queued hub status update: connected=%d", target_connected);
+        }
+
+        // If hub connection status needs sync to backend:
+        if (status_needs_sync) {
+            if (wifi_is_connected()) {
+                if (xTaskGetTickCount() - last_retry > pdMS_TO_TICKS(2000)) {
+                    last_retry = xTaskGetTickCount();
+                    ESP_LOGI(TAG, "POST /hub/status connected=%d...", target_connected);
+                    bool ok = http_post_json_body("/hub/status",
+                        target_connected ? "{\"connected\":true}" : "{\"connected\":false}");
+                    if (ok) {
+                        status_needs_sync = false;
+                        ESP_LOGI(TAG, "POST /hub/status connected=%d -> OK", target_connected);
+                    } else {
+                        ESP_LOGW(TAG, "POST /hub/status connected=%d -> FAILED, will retry", target_connected);
+                    }
+                }
+            } else {
+                if (xTaskGetTickCount() - last_retry > pdMS_TO_TICKS(5000)) {
+                    last_retry = xTaskGetTickCount();
+                    ESP_LOGI(TAG, "Waiting for Wi-Fi connection to sync /hub/status (connected=%d)", target_connected);
+                }
+            }
+        }
+
+        if (wifi_is_connected() && (xTaskGetTickCount() - last_pull > pdMS_TO_TICKS(30000))) {
+            pull_personal_vocabulary();
+            pull_language_setting();
+            pull_pending_recording();
+            last_pull = xTaskGetTickCount();
+        }
+    }
+}

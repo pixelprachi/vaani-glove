@@ -1,0 +1,21 @@
+dependencies:
+  espressif/esp-nn:
+    component_hash: 41b0ab49a5a5c88fc7331d76fc5cc58d1ec3e356ff42ea9cb88270daf415ffef
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.2
+  idf:
+    source:
+      type: idf
+    version: 5.2.0
+direct_dependencies:
+- espressif/esp-nn
+- idf
+manifest_hash: 1a541ff6c56d41bddae0deb3141a25da97a1667404a469f10fd4793c94ef7cf0
+target: esp32s3
+version: 2.0.0
